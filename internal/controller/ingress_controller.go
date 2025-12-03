@@ -3,6 +3,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,7 +11,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -89,7 +90,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Fetch the Ingress
 	var ingress networkingv1.Ingress
 	if err := r.Get(ctx, req.NamespacedName, &ingress); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Ingress deleted - PangolinResource will be garbage collected via ownerReference
 			log.V(1).Info("Ingress not found, assuming deleted")
 			return ctrl.Result{}, nil
@@ -155,6 +156,10 @@ func (r *IngressReconciler) processHosts(
 	// Track which PangolinResource names we create/update for orphan cleanup
 	desiredNames := make(map[string]bool)
 
+	// Collect errors from processing hosts so we can continue with all hosts
+	// and still attempt orphan cleanup even if some hosts fail
+	var hostErrors []error
+
 	// Process each host
 	for _, group := range hostGroups {
 		// Build desired PangolinResource for this host
@@ -169,7 +174,8 @@ func (r *IngressReconciler) processHosts(
 		// Set owner reference for garbage collection
 		if err := ctrl.SetControllerReference(ingress, desired, r.Scheme); err != nil {
 			log.Error(err, "Failed to set owner reference", "host", group.Host)
-			return ctrl.Result{}, err
+			hostErrors = append(hostErrors, fmt.Errorf("host %q: failed to set owner reference: %w", group.Host, err))
+			continue // Continue processing other hosts
 		}
 
 		desiredNames[desired.Name] = true
@@ -177,14 +183,20 @@ func (r *IngressReconciler) processHosts(
 		// Create or update PangolinResource
 		if _, err := r.reconcilePangolinResource(ctx, ingress, desired); err != nil {
 			log.Error(err, "Failed to reconcile PangolinResource", "host", group.Host)
-			return ctrl.Result{}, err
+			hostErrors = append(hostErrors, fmt.Errorf("host %q: failed to reconcile PangolinResource: %w", group.Host, err))
+			continue // Continue processing other hosts
 		}
 	}
 
-	// Clean up orphaned PangolinResources (hosts removed from Ingress)
+	// Always attempt orphan cleanup even if some hosts failed to process
 	if err := r.cleanupOrphanedResources(ctx, ingress, desiredNames); err != nil {
 		log.Error(err, "Failed to cleanup orphaned resources")
-		return ctrl.Result{}, err
+		hostErrors = append(hostErrors, fmt.Errorf("failed to cleanup orphaned resources: %w", err))
+	}
+
+	// Return aggregate error if any hosts failed
+	if len(hostErrors) > 0 {
+		return ctrl.Result{}, errors.Join(hostErrors...)
 	}
 
 	return ctrl.Result{}, nil
@@ -248,7 +260,7 @@ func (r *IngressReconciler) cleanupOrphanedResources(
 	for _, resource := range resourceList.Items {
 		if !desiredNames[resource.Name] {
 			log.Info("Deleting orphaned PangolinResource", "resource", resource.Name)
-			if err := r.Delete(ctx, &resource); err != nil && !errors.IsNotFound(err) {
+			if err := r.Delete(ctx, &resource); err != nil && !apierrors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete orphaned resource %s: %w", resource.Name, err)
 			}
 			r.Recorder.Event(ingress, corev1.EventTypeNormal, "Deleted",
@@ -460,7 +472,7 @@ func (r *IngressReconciler) reconcilePangolinResource(
 	var existing pangolincrd.PangolinResource
 	err := r.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, &existing)
 
-	if errors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) {
 		// Create new resource
 		log.Info("Creating PangolinResource")
 		if err := r.Create(ctx, desired); err != nil {
@@ -557,7 +569,7 @@ func (r *IngressReconciler) handleUnmanaged(ctx context.Context, ingress *networ
 
 	for _, resource := range resourceList.Items {
 		log.Info("Deleting PangolinResource for unmanaged Ingress", "resource", resource.Name)
-		if err := r.Delete(ctx, &resource); err != nil && !errors.IsNotFound(err) {
+		if err := r.Delete(ctx, &resource); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "Failed to delete PangolinResource")
 			return ctrl.Result{}, err
 		}
