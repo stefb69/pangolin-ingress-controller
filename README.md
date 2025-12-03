@@ -1,10 +1,12 @@
 # Pangolin Ingress Controller (PIC)
 
-A Kubernetes Ingress Controller that exposes services via [Pangolin](https://github.com/your-org/pangolin) by creating `PangolinResource` CRDs.
+A Kubernetes Ingress Controller that exposes services via [Pangolin](https://github.com/fosrl/pangolin) by creating `PangolinResource` CRDs.
 
 ## Overview
 
 PIC enables a **Kubernetes-native experience** for exposing services through Pangolin. Instead of manually configuring Pangolin, you simply create a standard Kubernetes `Ingress` resource.
+
+### Basic Example
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -26,7 +28,63 @@ spec:
                   number: 8080
 ```
 
-PIC will automatically create a `PangolinResource` that `pangolin-operator` processes to expose your service.
+### With SSO Authentication
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  annotations:
+    pangolin.ingress.k8s.io/sso: "true"
+    pangolin.ingress.k8s.io/block-access: "true"
+spec:
+  ingressClassName: pangolin
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app
+                port:
+                  number: 8080
+```
+
+### Multi-Path Routing
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  annotations:
+    pangolin.ingress.k8s.io/sso: "false"
+spec:
+  ingressClassName: pangolin
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8080
+          - path: /web
+            pathType: Prefix
+            backend:
+              service:
+                name: web-service
+                port:
+                  number: 80
+```
+
+PIC will automatically create a `PangolinResource` with multiple targets, each with path-based routing configured.
 
 ## Prerequisites
 
@@ -57,7 +115,7 @@ helm install pic ./charts/pangolin-ingress-controller \
 ### Raw manifests
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/wizzz/pangolin-ingress-controller/main/deploy/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/stefb69/pangolin-ingress-controller/main/deploy/install.yaml
 ```
 
 ## Configuration
@@ -87,12 +145,30 @@ Then use `ingressClassName: pangolin-eu` to route through `tunnel-eu`.
 
 ### Annotations
 
-| Annotation | Description |
-|------------|-------------|
-| `pangolin.ingress.k8s.io/enabled` | Enable/disable (`true`/`false`) |
-| `pangolin.ingress.k8s.io/tunnel-name` | Override tunnel |
-| `pangolin.ingress.k8s.io/domain-name` | Override domain |
-| `pangolin.ingress.k8s.io/subdomain` | Override subdomain |
+| Annotation | Default | Description |
+|------------|---------|-------------|
+| `pangolin.ingress.k8s.io/enabled` | `true` | Enable/disable PIC processing |
+| `pangolin.ingress.k8s.io/tunnel-name` | - | Override tunnel name |
+| `pangolin.ingress.k8s.io/domain-name` | - | Override domain |
+| `pangolin.ingress.k8s.io/subdomain` | - | Override subdomain |
+| `pangolin.ingress.k8s.io/sso` | `false` | Enable SSO authentication |
+| `pangolin.ingress.k8s.io/block-access` | `false` | Block access until authenticated (requires `sso: true`) |
+
+### SSO Authentication
+
+Pangolin supports SSO authentication to protect your services. Use the following annotations:
+
+- **`sso: "false"`** - Service is publicly accessible (default)
+- **`sso: "true"`** - SSO is enabled, users see identity but access is allowed
+- **`sso: "true"` + `block-access: "true"`** - Users must authenticate before accessing
+
+### Multi-Path Support
+
+PIC supports multiple paths per Ingress. Each path creates a separate target in Pangolin with:
+
+- **Path**: The URL path to match (e.g., `/api`)
+- **PathMatchType**: Derived from Ingress `pathType` (`Exact` → `exact`, `Prefix` → `prefix`)
+- **Priority**: Automatically calculated based on path length (longer paths = higher priority)
 
 ## Development
 
@@ -117,6 +193,39 @@ Ingress ──▶ PIC ──▶ PangolinResource ──▶ pangolin-operator ─
 ```
 
 PIC only manages `PangolinResource` objects. All Pangolin API interaction is handled by `pangolin-operator`.
+
+### Component Responsibilities
+
+| Component | Responsibility |
+|-----------|----------------|
+| **PIC** | Watches Ingress resources, creates/updates PangolinResource CRDs |
+| **pangolin-operator** | Watches PangolinResource CRDs, calls Pangolin API to create resources/targets |
+| **Pangolin API** | Manages the actual tunnel routing and SSO configuration |
+
+## Troubleshooting
+
+### Check PangolinResource status
+
+```bash
+kubectl get pangolinresources -A
+kubectl describe pangolinresource <name> -n <namespace>
+```
+
+### View controller logs
+
+```bash
+# PIC logs
+kubectl logs -n pangolin-system -l app.kubernetes.io/name=pangolin-ingress-controller
+
+# Operator logs
+kubectl logs -n pangolin-operator-system -l control-plane=controller-manager
+```
+
+### Force reconciliation
+
+```bash
+kubectl annotate ingress <name> reconcile=$(date +%s) --overwrite
+```
 
 ## License
 
