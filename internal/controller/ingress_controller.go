@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -208,7 +209,7 @@ func (r *IngressReconciler) collectHostPaths(ingress *networkingv1.Ingress) []Ho
 		}
 	}
 
-	// Convert map to slice for deterministic ordering
+	// Convert map to slice
 	var groups []HostPathGroup
 	for host, paths := range hostMap {
 		groups = append(groups, HostPathGroup{
@@ -216,6 +217,11 @@ func (r *IngressReconciler) collectHostPaths(ingress *networkingv1.Ingress) []Ho
 			Paths: paths,
 		})
 	}
+
+	// Sort by hostname for deterministic ordering
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].Host < groups[j].Host
+	})
 
 	return groups
 }
