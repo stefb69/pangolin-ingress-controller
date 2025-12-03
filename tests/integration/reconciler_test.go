@@ -136,9 +136,9 @@ func assertPangolinResourceSpec(t *testing.T, resource *pangolincrd.PangolinReso
 		assert.Equal(t, expected.HTTPConfig.Subdomain, resource.Spec.HTTPConfig.Subdomain)
 	}
 
-	if expected.Target != nil {
-		require.NotNil(t, resource.Spec.Target)
-		assert.Equal(t, expected.Target.IP, resource.Spec.Target.IP)
-		assert.Equal(t, expected.Target.Port, resource.Spec.Target.Port)
+	if len(expected.Targets) > 0 {
+		require.NotEmpty(t, resource.Spec.Targets)
+		assert.Equal(t, expected.Targets[0].IP, resource.Spec.Targets[0].IP)
+		assert.Equal(t, expected.Targets[0].Port, resource.Spec.Targets[0].Port)
 	}
 }

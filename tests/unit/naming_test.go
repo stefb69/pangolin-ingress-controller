@@ -34,13 +34,13 @@ func TestGenerateName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := util.GenerateName(tt.namespace, tt.ingressName, tt.host)
-			
+
 			// Check prefix
 			assert.Contains(t, result, tt.wantPrefix)
-			
+
 			// Check total length is reasonable (63 char k8s limit)
 			assert.LessOrEqual(t, len(result), 63)
-			
+
 			// Check deterministic (same input = same output)
 			result2 := util.GenerateName(tt.namespace, tt.ingressName, tt.host)
 			assert.Equal(t, result, result2)
@@ -64,10 +64,10 @@ func TestGenerateName_Unique(t *testing.T) {
 
 func TestGenerateName_ValidKubernetesName(t *testing.T) {
 	name := util.GenerateName("my-namespace", "my-ingress", "app.example.com")
-	
+
 	// Must be lowercase
 	assert.Equal(t, name, util.GenerateName("my-namespace", "my-ingress", "app.example.com"))
-	
+
 	// Must not start or end with hyphen
 	assert.NotEqual(t, '-', name[0])
 	assert.NotEqual(t, '-', name[len(name)-1])
