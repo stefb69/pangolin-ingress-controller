@@ -53,6 +53,57 @@ spec:
                   number: 8080
 ```
 
+### Multi-Host Ingress
+
+Expose multiple domains from a single Ingress resource. PIC creates one `PangolinResource` per host:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: multi-domain-app
+spec:
+  ingressClassName: pangolin
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8080
+    - host: admin.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: admin
+                port:
+                  number: 8080
+```
+
+This creates 3 separate `PangolinResource` objects:
+- `pic-default-multi-domain-app-<hash1>` for `app.example.com`
+- `pic-default-multi-domain-app-<hash2>` for `api.example.com`
+- `pic-default-multi-domain-app-<hash3>` for `admin.example.com`
+
+All resources are garbage collected when the Ingress is deleted.
+
 ### Multi-Path Routing
 
 ```yaml

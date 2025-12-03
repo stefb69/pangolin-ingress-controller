@@ -57,6 +57,14 @@ const (
 	IngressClassPrefix = "pangolin-"
 )
 
+// HostPathGroup groups all HTTP paths for a single host.
+// Used internally during multi-host reconciliation to aggregate paths
+// from potentially multiple rules that share the same host.
+type HostPathGroup struct {
+	Host  string
+	Paths []networkingv1.HTTPIngressPath
+}
+
 // IngressReconciler reconciles Ingress resources.
 type IngressReconciler struct {
 	client.Client
@@ -114,42 +122,135 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Process each rule (MVP: only first host)
+	// Process all hosts in the Ingress
+	return r.processHosts(ctx, &ingress, tunnelName, tunnelNamespace)
+}
+
+// processHosts processes all hosts in an Ingress, creating/updating PangolinResources.
+// It handles multi-host Ingresses by creating one PangolinResource per unique host.
+func (r *IngressReconciler) processHosts(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	tunnelName string,
+	tunnelNamespace string,
+) (ctrl.Result, error) {
+	log := r.Log.WithValues("ingress", types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace})
+
+	// Check for empty rules
 	if len(ingress.Spec.Rules) == 0 {
 		log.Info("Ingress has no rules, skipping")
-		r.Recorder.Event(&ingress, corev1.EventTypeWarning, "NoRules", "Ingress has no rules defined")
+		r.Recorder.Event(ingress, corev1.EventTypeWarning, "NoRules", "Ingress has no rules defined")
 		return ctrl.Result{}, nil
 	}
 
-	rule := ingress.Spec.Rules[0]
-	if len(ingress.Spec.Rules) > 1 {
-		r.Recorder.Event(&ingress, corev1.EventTypeWarning, "MultipleHosts",
-			"Multiple hosts detected, only processing first host (MVP limitation)")
-	}
+	// Collect and deduplicate hosts with their paths
+	hostGroups := r.collectHostPaths(ingress)
 
-	// Validate host
-	if rule.Host == "" {
-		log.Info("Ingress rule has no host, skipping")
-		r.Recorder.Event(&ingress, corev1.EventTypeWarning, "NoHost", "Ingress rule has no host")
+	if len(hostGroups) == 0 {
+		log.Info("Ingress has no valid hosts after filtering")
 		return ctrl.Result{}, nil
 	}
 
-	// Build desired PangolinResource
-	desired, err := r.buildDesiredPangolinResource(&ingress, rule.Host, tunnelName, tunnelNamespace)
-	if err != nil {
-		log.Error(err, "Failed to build desired PangolinResource")
-		r.Recorder.Event(&ingress, corev1.EventTypeWarning, "InvalidHost", err.Error())
-		return ctrl.Result{}, nil // Don't requeue, invalid host won't change
+	// Track which PangolinResource names we create/update for orphan cleanup
+	desiredNames := make(map[string]bool)
+
+	// Process each host
+	for _, group := range hostGroups {
+		// Build desired PangolinResource for this host
+		desired, err := r.buildDesiredPangolinResource(ingress, group.Host, group.Paths, tunnelName, tunnelNamespace)
+		if err != nil {
+			log.Error(err, "Failed to build desired PangolinResource", "host", group.Host)
+			r.Recorder.Event(ingress, corev1.EventTypeWarning, "InvalidHost",
+				fmt.Sprintf("Host %q: %s", group.Host, err.Error()))
+			continue // Skip this host, try others
+		}
+
+		// Set owner reference for garbage collection
+		if err := ctrl.SetControllerReference(ingress, desired, r.Scheme); err != nil {
+			log.Error(err, "Failed to set owner reference", "host", group.Host)
+			return ctrl.Result{}, err
+		}
+
+		desiredNames[desired.Name] = true
+
+		// Create or update PangolinResource
+		if _, err := r.reconcilePangolinResource(ctx, ingress, desired); err != nil {
+			log.Error(err, "Failed to reconcile PangolinResource", "host", group.Host)
+			return ctrl.Result{}, err
+		}
 	}
 
-	// Set owner reference
-	if err := ctrl.SetControllerReference(&ingress, desired, r.Scheme); err != nil {
-		log.Error(err, "Failed to set owner reference")
+	// Clean up orphaned PangolinResources (hosts removed from Ingress)
+	if err := r.cleanupOrphanedResources(ctx, ingress, desiredNames); err != nil {
+		log.Error(err, "Failed to cleanup orphaned resources")
 		return ctrl.Result{}, err
 	}
 
-	// Create or update PangolinResource
-	return r.reconcilePangolinResource(ctx, &ingress, desired)
+	return ctrl.Result{}, nil
+}
+
+// collectHostPaths groups all paths by host, deduplicating hosts that appear in multiple rules.
+// Empty hosts are skipped with a warning event.
+func (r *IngressReconciler) collectHostPaths(ingress *networkingv1.Ingress) []HostPathGroup {
+	hostMap := make(map[string][]networkingv1.HTTPIngressPath)
+
+	for _, rule := range ingress.Spec.Rules {
+		// Skip empty hosts (FR-007)
+		if rule.Host == "" {
+			r.Recorder.Event(ingress, corev1.EventTypeWarning, "EmptyHost",
+				"Rule with empty host skipped")
+			continue
+		}
+
+		// Collect paths for this host
+		if rule.HTTP != nil {
+			hostMap[rule.Host] = append(hostMap[rule.Host], rule.HTTP.Paths...)
+		}
+	}
+
+	// Convert map to slice for deterministic ordering
+	var groups []HostPathGroup
+	for host, paths := range hostMap {
+		groups = append(groups, HostPathGroup{
+			Host:  host,
+			Paths: paths,
+		})
+	}
+
+	return groups
+}
+
+// cleanupOrphanedResources deletes PangolinResources that are no longer needed.
+// This happens when a host is removed from an Ingress.
+func (r *IngressReconciler) cleanupOrphanedResources(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	desiredNames map[string]bool,
+) error {
+	log := r.Log.WithValues("ingress", types.NamespacedName{Name: ingress.Name, Namespace: ingress.Namespace})
+
+	// List all PangolinResources owned by this Ingress
+	var resourceList pangolincrd.PangolinResourceList
+	if err := r.List(ctx, &resourceList,
+		client.InNamespace(ingress.Namespace),
+		client.MatchingLabels{LabelIngressUID: string(ingress.UID)},
+	); err != nil {
+		return fmt.Errorf("failed to list PangolinResources: %w", err)
+	}
+
+	// Delete resources that are no longer desired
+	for _, resource := range resourceList.Items {
+		if !desiredNames[resource.Name] {
+			log.Info("Deleting orphaned PangolinResource", "resource", resource.Name)
+			if err := r.Delete(ctx, &resource); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete orphaned resource %s: %w", resource.Name, err)
+			}
+			r.Recorder.Event(ingress, corev1.EventTypeNormal, "Deleted",
+				fmt.Sprintf("Deleted PangolinResource %s (host removed)", resource.Name))
+		}
+	}
+
+	return nil
 }
 
 // isManaged checks if the Ingress should be managed by PIC.
@@ -219,9 +320,11 @@ func (r *IngressReconciler) validateTunnel(ctx context.Context, tunnelName strin
 }
 
 // buildDesiredPangolinResource creates the desired PangolinResource spec.
+// It accepts the host and its associated paths (already collected and deduplicated).
 func (r *IngressReconciler) buildDesiredPangolinResource(
 	ingress *networkingv1.Ingress,
 	host string,
+	paths []networkingv1.HTTPIngressPath,
 	tunnelName string,
 	tunnelNamespace string,
 ) (*pangolincrd.PangolinResource, error) {
@@ -239,52 +342,50 @@ func (r *IngressReconciler) buildDesiredPangolinResource(
 		subdomain = override
 	}
 
-	// Build targets from all paths in the Ingress rule
+	// Build targets from the provided paths for this host
 	var targets []pangolincrd.Target
 
-	if len(ingress.Spec.Rules) > 0 && ingress.Spec.Rules[0].HTTP != nil {
-		for _, path := range ingress.Spec.Rules[0].HTTP.Paths {
-			if path.Backend.Service == nil {
-				continue
-			}
-
-			backendHost := fmt.Sprintf("%s.%s.svc.cluster.local",
-				path.Backend.Service.Name, ingress.Namespace)
-			var backendPort int32
-			if path.Backend.Service.Port.Number != 0 {
-				backendPort = path.Backend.Service.Port.Number
-			}
-
-			// Map Ingress pathType to Pangolin pathMatchType
-			pathMatchType := "prefix" // default
-			if path.PathType != nil {
-				switch *path.PathType {
-				case networkingv1.PathTypeExact:
-					pathMatchType = "exact"
-				case networkingv1.PathTypePrefix:
-					pathMatchType = "prefix"
-				case networkingv1.PathTypeImplementationSpecific:
-					pathMatchType = "prefix" // default to prefix
-				}
-			}
-
-			// Calculate priority based on path specificity
-			// Longer paths get higher priority (matched first)
-			priority := int32(100 + len(path.Path)*10)
-			if priority > 1000 {
-				priority = 1000
-			}
-
-			target := pangolincrd.Target{
-				IP:            backendHost,
-				Port:          backendPort,
-				Method:        r.Config.BackendScheme,
-				Path:          path.Path,
-				PathMatchType: pathMatchType,
-				Priority:      priority,
-			}
-			targets = append(targets, target)
+	for _, path := range paths {
+		if path.Backend.Service == nil {
+			continue
 		}
+
+		backendHost := fmt.Sprintf("%s.%s.svc.cluster.local",
+			path.Backend.Service.Name, ingress.Namespace)
+		var backendPort int32
+		if path.Backend.Service.Port.Number != 0 {
+			backendPort = path.Backend.Service.Port.Number
+		}
+
+		// Map Ingress pathType to Pangolin pathMatchType
+		pathMatchType := "prefix" // default
+		if path.PathType != nil {
+			switch *path.PathType {
+			case networkingv1.PathTypeExact:
+				pathMatchType = "exact"
+			case networkingv1.PathTypePrefix:
+				pathMatchType = "prefix"
+			case networkingv1.PathTypeImplementationSpecific:
+				pathMatchType = "prefix" // default to prefix
+			}
+		}
+
+		// Calculate priority based on path specificity
+		// Longer paths get higher priority (matched first)
+		priority := int32(100 + len(path.Path)*10)
+		if priority > 1000 {
+			priority = 1000
+		}
+
+		target := pangolincrd.Target{
+			IP:            backendHost,
+			Port:          backendPort,
+			Method:        r.Config.BackendScheme,
+			Path:          path.Path,
+			PathMatchType: pathMatchType,
+			Priority:      priority,
+		}
+		targets = append(targets, target)
 	}
 
 	if len(targets) == 0 {
@@ -295,7 +396,8 @@ func (r *IngressReconciler) buildDesiredPangolinResource(
 	name := util.GenerateName(ingress.Namespace, ingress.Name, host)
 
 	// Generate display name for Pangolin UI
-	displayName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
+	// Must be unique per host since Pangolin uses this as resource identifier
+	displayName := fmt.Sprintf("%s/%s/%s", ingress.Namespace, ingress.Name, host)
 
 	// Protocol is always "http" for Ingress resources
 	// Pangolin handles TLS termination automatically

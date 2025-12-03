@@ -16,10 +16,34 @@ const (
 )
 
 // GenerateName creates a deterministic resource name for a PangolinResource.
-// Format: pic-<namespace>-<ingress>-<hash>
 //
-// The hash ensures uniqueness when the same ingress name exists in different
-// namespaces or exposes different hosts.
+// # Algorithm
+//
+// The name is generated using the format: pic-<namespace>-<ingress>-<hash>
+//
+// The hash is computed from: SHA256(namespace + "/" + ingressName + "/" + host)
+// Only the first 4 bytes (8 hex characters) are used for brevity.
+//
+// # Multi-Host Support
+//
+// This function is designed to support multi-host Ingresses. Each unique host
+// in an Ingress will produce a different hash, ensuring that:
+//   - Different hosts in the same Ingress get different PangolinResource names
+//   - The same host always produces the same name (idempotent)
+//   - Names are deterministic and predictable for GitOps workflows
+//
+// # Examples
+//
+//	GenerateName("default", "myapp", "app.example.com")  -> "pic-default-myapp-a1b2c3d4"
+//	GenerateName("default", "myapp", "api.example.com")  -> "pic-default-myapp-e5f6g7h8"
+//	GenerateName("prod", "myapp", "app.example.com")     -> "pic-prod-myapp-i9j0k1l2"
+//
+// # Kubernetes Name Constraints
+//
+// The generated name is sanitized to comply with Kubernetes naming rules:
+//   - Maximum 63 characters
+//   - Lowercase alphanumeric and hyphens only
+//   - Cannot start or end with a hyphen
 func GenerateName(namespace, ingressName, host string) string {
 	// Create hash from all components for uniqueness
 	hashInput := fmt.Sprintf("%s/%s/%s", namespace, ingressName, host)
